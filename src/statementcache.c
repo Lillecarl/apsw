@@ -84,6 +84,24 @@ typedef struct StatementCache
 /* the hash value we use for unoccupied */
 #define SC_SENTINEL_HASH (-1)
 
+/* sqlite3_reset or sqlite3_finalize.  A statement stopped at a row halts in
+   them, and the halt can commit, so the GIL is released.  For any other
+   statement they are quick, and releasing the GIL there measurably slows
+   executemany. */
+static int
+statement_halt(sqlite3_stmt *stmt, int (*halt)(sqlite3_stmt *))
+{
+  int res;
+
+  if (!sqlite3_stmt_busy(stmt))
+    return halt(stmt);
+
+  Py_BEGIN_ALLOW_THREADS
+    res = halt(stmt);
+  Py_END_ALLOW_THREADS;
+  return res;
+}
+
 static int
 statementcache_free_statement(StatementCache *sc, APSWStatement *s)
 {
@@ -91,7 +109,7 @@ statementcache_free_statement(StatementCache *sc, APSWStatement *s)
 
   Py_CLEAR(s->query);
 
-  res = s->vdbestatement ? sqlite3_finalize(s->vdbestatement) : SQLITE_OK;
+  res = s->vdbestatement ? statement_halt(s->vdbestatement, sqlite3_finalize) : SQLITE_OK;
 
 #if SC_STATEMENT_RECYCLE_BIN_ENTRIES > 0
   if (sc && sc->recycle_bin_next < SC_STATEMENT_RECYCLE_BIN_ENTRIES)
@@ -125,7 +143,7 @@ statementcache_finalize(StatementCache *sc, APSWStatement *statement)
   {
     APSWStatement *evictee = NULL;
 
-    res = sqlite3_reset(statement->vdbestatement);
+    res = statement_halt(statement->vdbestatement, sqlite3_reset);
 
     /*
       https://sqlite.org/forum/forumpost/d72cba6ff7

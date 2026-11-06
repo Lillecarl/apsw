@@ -168,7 +168,11 @@ resetcursor(APSWCursor *self, int force)
 
   if (self->statement)
   {
-    res = statementcache_finalize(self->connection->stmtcache, self->statement);
+    /* the finalize releases the GIL, and the cursor attributes read
+       self->statement without the db mutex */
+    APSWStatement *statement = self->statement;
+    self->statement = 0;
+    res = statementcache_finalize(self->connection->stmtcache, statement);
     if (res == SQLITE_OK && PyErr_Occurred())
       res = SQLITE_ERROR;
     if (res)
@@ -178,7 +182,6 @@ resetcursor(APSWCursor *self, int force)
       else
         SET_EXC(res, self->connection->db);
     }
-    self->statement = 0;
   }
 
   Py_CLEAR(self->bindings);
@@ -1170,8 +1173,9 @@ APSWCursor_step(APSWCursor *self)
       }
 
       /* we need to clear just completed and restart original executemany statement */
-      statementcache_finalize(self->connection->stmtcache, self->statement);
+      APSWStatement *done = self->statement;
       self->statement = NULL;
+      statementcache_finalize(self->connection->stmtcache, done);
       /* don't need bindings from last round if emiter.next() */
       Py_CLEAR(self->bindings);
       self->bindingsoffset = 0;
