@@ -554,9 +554,13 @@ Connection_close_internal(Connection *self, int force)
 
   sqlite3_mutex_leave(dbmutex);
 
+  /* the last close of a WAL database checkpoints, which syncs to disk.
+     self->db is already cleared, so no other thread can reach db. */
   for (int count = 0; count < 100; count++)
   {
-    res = sqlite3_close(db);
+    Py_BEGIN_ALLOW_THREADS
+      res = sqlite3_close(db);
+    Py_END_ALLOW_THREADS;
     if (res == SQLITE_BUSY)
     {
       /* we can be racing with a destructor such as cursor which is
@@ -572,7 +576,9 @@ Connection_close_internal(Connection *self, int force)
     /* we consider the connection closed but are unable to close it.  the likely
        explanation is problems with a dependent, or an extension.  the former
        won't happen unless we run out of memory */
-    sqlite3_close_v2(db);
+    Py_BEGIN_ALLOW_THREADS
+      sqlite3_close_v2(db);
+    Py_END_ALLOW_THREADS;
 
     SET_EXC(res, NULL);
     if (force == 2)
