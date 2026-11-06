@@ -5690,7 +5690,10 @@ Connection_table_exists(PyObject *self_, PyObject *const *fast_args, Py_ssize_t 
   ASYNC_FASTCALL(self, Connection_table_exists);
 
   DBMUTEX_ENSURE(self);
-  res = sqlite3_table_column_metadata(self->db, dbname, table_name, NULL, NULL, NULL, NULL, NULL, NULL);
+  /* reading the schema can wait for a lock */
+  Py_BEGIN_ALLOW_THREADS
+    res = sqlite3_table_column_metadata(self->db, dbname, table_name, NULL, NULL, NULL, NULL, NULL, NULL);
+  Py_END_ALLOW_THREADS;
   if (res != SQLITE_OK && res != SQLITE_ERROR)
     SET_EXC(res, self->db);
   sqlite3_mutex_leave(self->dbmutex);
@@ -5747,8 +5750,11 @@ Connection_column_metadata(PyObject *self_, PyObject *const *fast_args, Py_ssize
   ASYNC_FASTCALL(self, Connection_column_metadata);
 
   DBMUTEX_ENSURE(self);
-  res = sqlite3_table_column_metadata(self->db, dbname, table_name, column_name, &datatype, &collseq, &notnull,
-                                      &primarykey, &autoinc);
+  /* reading the schema can wait for a lock */
+  Py_BEGIN_ALLOW_THREADS
+    res = sqlite3_table_column_metadata(self->db, dbname, table_name, column_name, &datatype, &collseq, &notnull,
+                                        &primarykey, &autoinc);
+  Py_END_ALLOW_THREADS;
 
   SET_EXC(res, self->db);
   sqlite3_mutex_leave(self->dbmutex);
