@@ -5781,7 +5781,10 @@ Connection_cache_flush(PyObject *self_, PyObject *unused)
   ASYNC_BINARY(self, Connection_cache_flush, self_, unused);
 
   DBMUTEX_ENSURE(self);
-  res = sqlite3_db_cacheflush(self->db);
+  /* writing dirty pages can wait for readers */
+  Py_BEGIN_ALLOW_THREADS
+    res = sqlite3_db_cacheflush(self->db);
+  Py_END_ALLOW_THREADS;
   SET_EXC(res, self->db);
   sqlite3_mutex_leave(self->dbmutex);
 
