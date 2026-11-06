@@ -1,0 +1,40 @@
+name: LoopStall with test extension
+
+on:
+  push:
+    branches: [ci-loopstall]
+  workflow_dispatch:
+
+jobs:
+  loopstall:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm, macos-15, macos-15-intel, ubuntu-latest]
+        python: ["3.12", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      # the pypi config: fetch SQLite, all extensions except icu
+      - name: Build in place with the test extension
+        run: |
+          python -m pip install setuptools
+          python -c "import shutil ; shutil.copyfile('tools/setup-pypi.cfg','setup.apsw')"
+          python setup.py build_ext --inplace --force
+          python setup.py build_test_extension
+
+      - name: LoopStall, five times
+        shell: bash
+        run: |
+          for i in 1 2 3 4 5; do
+            python -m unittest -v apsw.tests.aiotest.LoopStall
+          done
+
+      - name: Full suite
+        run: python -m apsw.tests
