@@ -4868,7 +4868,11 @@ connection_context_manager_exec(Connection *self, const char *sql, int continue_
   }
 
   char *errmsg = NULL;
-  int res = sqlite3_exec(self->db, sql, 0, 0, &errmsg);
+  int res;
+  /* BEGIN and COMMIT can wait for a lock and sync to disk */
+  Py_BEGIN_ALLOW_THREADS
+    res = sqlite3_exec(self->db, sql, 0, 0, &errmsg);
+  Py_END_ALLOW_THREADS;
   if (res != SQLITE_OK)
   {
     /* in these cases we won't create an exception */
