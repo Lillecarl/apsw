@@ -91,7 +91,14 @@ statementcache_free_statement(StatementCache *sc, APSWStatement *s)
 
   Py_CLEAR(s->query);
 
-  res = s->vdbestatement ? sqlite3_finalize(s->vdbestatement) : SQLITE_OK;
+  res = SQLITE_OK;
+  if (s->vdbestatement)
+  {
+    /* a statement stopped at a row halts here, which can commit */
+    Py_BEGIN_ALLOW_THREADS
+      res = sqlite3_finalize(s->vdbestatement);
+    Py_END_ALLOW_THREADS;
+  }
 
 #if SC_STATEMENT_RECYCLE_BIN_ENTRIES > 0
   if (sc && sc->recycle_bin_next < SC_STATEMENT_RECYCLE_BIN_ENTRIES)
@@ -125,7 +132,10 @@ statementcache_finalize(StatementCache *sc, APSWStatement *statement)
   {
     APSWStatement *evictee = NULL;
 
-    res = sqlite3_reset(statement->vdbestatement);
+    /* a statement stopped at a row halts here, which can commit */
+    Py_BEGIN_ALLOW_THREADS
+      res = sqlite3_reset(statement->vdbestatement);
+    Py_END_ALLOW_THREADS;
 
     /*
       https://sqlite.org/forum/forumpost/d72cba6ff7
