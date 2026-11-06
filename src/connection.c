@@ -1060,7 +1060,10 @@ Connection_blob_open(PyObject *self_, PyObject *const *fast_args, Py_ssize_t fas
   ASYNC_FASTCALL(self, Connection_blob_open);
 
   DBMUTEX_ENSURE(self);
-  res = sqlite3_blob_open(self->db, database, table, column, rowid, writeable, &blob);
+  /* reads the schema and the row, which can wait for a lock */
+  Py_BEGIN_ALLOW_THREADS
+    res = sqlite3_blob_open(self->db, database, table, column, rowid, writeable, &blob);
+  Py_END_ALLOW_THREADS;
 
   SET_EXC(res, self->db);
   sqlite3_mutex_leave(self->dbmutex);
