@@ -14,7 +14,9 @@ import random
 import sys
 import math
 import inspect
+import os
 import re
+import time
 
 import apsw
 import apsw.aio
@@ -1495,7 +1497,267 @@ fractal_sql = """
     SELECT group_concat(rtrim(t),x'0a') FROM a;"""
 
 
-__all__ = ("Async",)
+class LoopStall(unittest.TestCase):
+    """SQLite calls that can wait on a lock or on the disk must release the GIL
+
+    The connection's worker thread makes the call.  If it holds the GIL while
+    SQLite waits, the event loop (and every other thread) stops for the whole
+    wait.  Each test makes SQLite wait in C for ``wait`` seconds, and checks
+    that the event loop kept running meanwhile."""
+
+    wait = 0.3
+
+    # the event loop must not stop for longer than this.  A stall stops it
+    # for the whole wait, so there is room for timer granularity (15.6ms on
+    # Windows) and busy CI machines.
+    max_gap = wait / 3
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory(prefix="apsw-loopstall-")
+        self.filename = os.path.join(self.tmpdir.name, "db")
+        con = apsw.Connection(self.filename)
+        con.execute("create table t(x); insert into t values(1), (2), (3); create table b(x); insert into b values(x'00')")
+        # sessions only record tables with a primary key
+        con.execute("create table s(a integer primary key, b); insert into s values(1, 1)")
+        con.close()
+
+    def tearDown(self):
+        for c in apsw.connections():
+            c.close(True)
+        self.tmpdir.cleanup()
+
+    def hold_read_lock(self):
+        "a reader stopped at a row keeps the SHARED lock, so a commit in rollback journal mode waits"
+        con = apsw.Connection(self.filename)
+        # the cursor must stay alive, because a reset releases the lock
+        self.reader = con.execute("select * from t")
+        next(self.reader)
+        return con
+
+    def hold_write_lock(self):
+        con = apsw.Connection(self.filename)
+        con.execute("begin immediate")
+        return con
+
+    def hold_exclusive_lock(self):
+        "readers wait, including reads of the schema"
+        con = apsw.Connection(self.filename)
+        con.execute("begin exclusive")
+        return con
+
+    async def measure(self, op, *args):
+        """runs op(*args) and measures the longest time the event loop did not run
+
+        Returns (duration, gap, exception)"""
+        import asyncio
+
+        gap = 0.0
+        exception = None
+        stop = False
+
+        async def ticker():
+            nonlocal gap
+            last = time.monotonic()
+            while not stop:
+                await asyncio.sleep(0.005)
+                now = time.monotonic()
+                gap = max(gap, now - last)
+                last = now
+
+        task = asyncio.create_task(ticker())
+        await asyncio.sleep(0.02)
+        start = time.monotonic()
+        try:
+            await op(*args)
+        except apsw.Error as exc:
+            exception = exc
+        duration = time.monotonic() - start
+        stop = True
+        await task
+        return duration, gap, exception
+
+    def check_lock_wait(self, op, hold, expected=apsw.BusyError, prepare=None):
+        """op(db) must wait on the lock that hold() takes, without stopping the event loop
+
+        prepare(db) runs before the lock is taken, and returns the arguments
+        for op after db"""
+
+        async def run():
+            # a cursor must stop at its first row, not prefetch to the end
+            apsw.async_cursor_prefetch.set(1)
+            db = await apsw.Connection.as_async(self.filename)
+            args = await prepare(db) if prepare else ()
+            await db.set_busy_timeout(int(self.wait * 1000))
+            holder = hold()
+            try:
+                return await self.measure(op, db, *args)
+            finally:
+                holder.close(True)
+                await db.aclose()
+
+        duration, gap, exception = self.run_async(run())
+        self.assertIsInstance(exception, expected)
+        self.check_gap(duration, gap)
+
+    def run_async(self, coro):
+        import asyncio
+
+        try:
+            return asyncio.run(coro)
+        except RuntimeError as exc:
+            if "can't start new thread" in str(exc):
+                self.skipTest("threads are not available")
+            raise
+
+    def check_gap(self, duration, gap):
+        # if SQLite did not wait, the test proves nothing
+        self.assertGreaterEqual(duration, self.wait * 0.8, "SQLite did not wait")
+        self.assertLess(gap, self.max_gap, f"the event loop stopped for {gap:.3f}s of a {duration:.3f}s call")
+
+    def testEnter(self):
+        "Connection.__enter__ runs BEGIN, which waits for another writer"
+
+        async def op(db):
+            db.transaction_mode = "IMMEDIATE"
+            async with db:
+                pass
+
+        self.check_lock_wait(op, self.hold_write_lock)
+
+    def testExit(self):
+        "Connection.__exit__ runs COMMIT, which waits for readers"
+
+        async def op(db):
+            async with db:
+                await db.execute("insert into t values(4)")
+
+        self.check_lock_wait(op, self.hold_read_lock)
+
+    def testCursorReset(self):
+        "closing a cursor stopped at a row resets the statement, which commits"
+
+        async def op(db):
+            cursor = await db.execute("insert into t values(4), (5), (6) returning x")
+            async for _ in cursor:
+                break
+            await cursor.aclose()
+
+        self.check_lock_wait(op, self.hold_read_lock)
+
+    def testCursorFinalize(self):
+        "closing a cursor stopped at a row finalizes an uncached statement, which commits"
+
+        async def op(db):
+            cursor = await db.execute("insert into t values(4), (5), (6) returning x", can_cache=False)
+            async for _ in cursor:
+                break
+            await cursor.aclose()
+
+        self.check_lock_wait(op, self.hold_read_lock)
+
+    def testBlobOpen(self):
+        "Connection.blob_open reads the schema, which waits for a writer"
+
+        async def op(db):
+            blob = await db.blob_open("main", "b", "x", 1, False)
+            await blob.aclose()
+
+        # SQLite reports the lock as "database is locked" with SQLITE_ERROR
+        self.check_lock_wait(op, self.hold_exclusive_lock, apsw.SQLError)
+
+    def testBlobClose(self):
+        "closing a blob that was written commits, which waits for readers"
+
+        async def op(db):
+            blob = await db.blob_open("main", "b", "x", 1, True)
+            await blob.write(b"\x01")
+            await blob.aclose()
+
+        self.check_lock_wait(op, self.hold_read_lock)
+
+    def testTableExists(self):
+        "Connection.table_exists reads the schema, which waits for a writer"
+
+        async def op(db):
+            await db.table_exists(None, "t")
+
+        self.check_lock_wait(op, self.hold_exclusive_lock)
+
+    def testColumnMetadata(self):
+        "Connection.column_metadata reads the schema, which waits for a writer"
+
+        async def op(db):
+            await db.column_metadata(None, "t", "x")
+
+        self.check_lock_wait(op, self.hold_exclusive_lock)
+
+    def testCacheFlush(self):
+        "Connection.cache_flush writes dirty pages, which waits for readers"
+
+        async def op(db):
+            await db.execute("begin; insert into t values(4)")
+            try:
+                await db.cache_flush()
+            finally:
+                await db.execute("rollback")
+
+        self.check_lock_wait(op, self.hold_read_lock)
+
+    async def prepare_session(self, db):
+        session = await apsw.aio.make_session(db, "main")
+        await session.attach()
+        await db.execute("update s set b = 7 where a = 1")
+        return (session,)
+
+    def testSessionChangeset(self):
+        "Session.changeset reads the current rows, which waits for a writer"
+        if not hasattr(apsw, "Session"):
+            self.skipTest("the session extension is not available")
+
+        async def op(db, session):
+            await session.changeset()
+
+        self.check_lock_wait(op, self.hold_exclusive_lock, prepare=self.prepare_session)
+
+    def testSessionPatchset(self):
+        "Session.patchset reads the current rows, which waits for a writer"
+        if not hasattr(apsw, "Session"):
+            self.skipTest("the session extension is not available")
+
+        async def op(db, session):
+            await session.patchset()
+
+        self.check_lock_wait(op, self.hold_exclusive_lock, prepare=self.prepare_session)
+
+    def testClose(self):
+        "closing the last connection to a WAL database checkpoints, and the checkpoint syncs"
+        if not hasattr(apsw.Connection, "load_extension") or not os.path.exists(LOADEXTENSIONFILENAME):
+            self.skipTest("needs the test extension: python3 setup.py build_test_extension")
+
+        loader = apsw.Connection("")
+        loader.enable_load_extension(True)
+        loader.load_extension(LOADEXTENSIONFILENAME, "slowsync_sqlite3_extension_init")
+        loader.close()
+
+        async def run():
+            uri = f"file:{self.filename}?sync_delay_ms={int(self.wait * 1000)}"
+            flags = apsw.SQLITE_OPEN_READWRITE | apsw.SQLITE_OPEN_URI
+            db = await apsw.Connection.as_async(uri, flags, "slowsync")
+            for sql in ("pragma journal_mode=wal", "pragma synchronous=normal", "insert into t values(4)"):
+                async for _ in await db.execute(sql):
+                    pass
+            return await self.measure(db.aclose)
+
+        duration, gap, exception = self.run_async(run())
+        self.assertIsNone(exception)
+        self.check_gap(duration, gap)
+
+
+# a directory must be given, otherwise $LD_LIBRARY_PATH is searched
+LOADEXTENSIONFILENAME = "testextension.sqlext" if sys.platform == "win32" else "./testextension.sqlext"
+
+
+__all__ = ("Async", "LoopStall")
 
 if __name__ == "__main__":
     unittest.main()
