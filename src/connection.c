@@ -639,6 +639,12 @@ Connection_close(PyObject *self_, PyObject *const *fast_args, Py_ssize_t fast_na
     ARG_EPILOG(NULL, Connection_close_USAGE, );
   }
 
+  /* closed, or a close in another thread is partway through with the GIL
+     released.  It cleared self->db and self->dbmutex first, so the mutex
+     check below would pass and both would free the same objects. */
+  if (!self->db)
+    Py_RETURN_NONE;
+
   DBMUTEX_ENSURE_ANY_THREAD(self);
   if (0 != Connection_close_internal(self, force))
   {
