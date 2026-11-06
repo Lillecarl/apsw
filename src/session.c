@@ -532,8 +532,13 @@ APSWSession_get_change_patch_set(APSWSession *self, int changeset)
   void *pChangeset = NULL;
 
   assert(sqlite3_mutex_held(self->connection->dbmutex));
-  int rc = changeset ? sqlite3session_changeset(self->session, &nChangeset, &pChangeset)
-                     : sqlite3session_patchset(self->session, &nChangeset, &pChangeset);
+  int rc;
+  /* reads the current rows, which can wait for a lock.  The only callback
+     is the table filter, which takes the GIL itself. */
+  Py_BEGIN_ALLOW_THREADS
+    rc = changeset ? sqlite3session_changeset(self->session, &nChangeset, &pChangeset)
+                   : sqlite3session_patchset(self->session, &nChangeset, &pChangeset);
+  Py_END_ALLOW_THREADS;
 
   PyObject *result = NULL;
   if (rc != SQLITE_OK)
@@ -772,9 +777,12 @@ APSWSession_table_filter(PyObject *self_, PyObject *const *fast_args, Py_ssize_t
     ARG_EPILOG(NULL, Session_table_filter_USAGE, );
   }
 
-  Py_CLEAR(self->table_filter);
-  self->table_filter = Py_NewRef(callback);
+  /* changeset and patchset release the GIL while SQLite can call the old
+     filter, so it must not be freed under them */
+  DBMUTEX_ENSURE_ANY_THREAD(self->connection);
   sqlite3session_table_filter(self->session, session_table_filter_cb, callback);
+  Py_XSETREF(self->table_filter, Py_NewRef(callback));
+  sqlite3_mutex_leave(self->connection->dbmutex);
 
   Py_RETURN_NONE;
 }
