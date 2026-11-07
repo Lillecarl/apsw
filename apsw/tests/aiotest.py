@@ -901,6 +901,37 @@ class Async(unittest.TestCase):
 
                 self.assertEqual(0, await db.pragma("user_version"))
 
+    async def atestCancelledOpen(self, fw):
+        "A cancelled as_async ends its worker thread, which is not a daemon and so would hold the process open"
+        sleep = getattr(sys.modules[fw], "sleep")
+        before = set(threading.enumerate())
+
+        match fw:
+            case "asyncio":
+
+                async def open_it():
+                    return await apsw.Connection.as_async("")
+
+                task = asyncio.create_task(open_it())
+                await sleep(0)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            case "trio":
+                with trio.CancelScope() as scope:
+                    scope.cancel()
+                    await apsw.Connection.as_async("")
+            case "anyio":
+                with anyio.CancelScope() as scope:
+                    scope.cancel()
+                    await apsw.Connection.as_async("")
+
+        deadline = time.monotonic() + 5
+        while left := set(threading.enumerate()) - before:
+            if time.monotonic() > deadline:
+                self.fail(f"the worker of a cancelled open is still running: {left}")
+            await sleep(0.01)
+
     async def atestTimeout(self, fw):
         sleep = getattr(sys.modules[fw], "sleep")
         Event = getattr(sys.modules[fw], "Event")

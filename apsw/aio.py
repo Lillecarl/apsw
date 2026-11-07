@@ -303,6 +303,12 @@ class AsyncIO:
                     # is a subclass of it
                     self.loop.call_soon_threadsafe(self.set_future_exception, tracker.completion, exc)
 
+            # Drop the call before waiting for the next. It owns what it made,
+            # a cancelled open's Connection too, and that Connection closes this
+            # controller only when freed: held here, this thread never ends.
+            _tls.current_call = None
+            del tracker
+
     def set_future_result(self, future: asyncio.Future, value: Any):
         if not future.done():
             future.set_result(value)
@@ -442,6 +448,12 @@ class Trio:
                 finally:
                     self.token.run_sync_soon(tracker.completion.set)
 
+            # Drop the call before waiting for the next. It owns what it made,
+            # a cancelled open's Connection too, and that Connection closes this
+            # controller only when freed: held here, this thread never ends.
+            _tls.current_call = None
+            del tracker
+
     def async_run_coro(self, coro: Coroutine):
         "Called in worker thread to run a coroutine in the event loop"
         try:
@@ -536,6 +548,12 @@ class AnyIO:
 
                 finally:
                     anyio.from_thread.run_sync(tracker.completion.set, token=self.token)
+
+            # Drop the call before waiting for the next. It owns what it made,
+            # a cancelled open's Connection too, and that Connection closes this
+            # controller only when freed: held here, this thread never ends.
+            _tls.current_call = None
+            del tracker
 
     def async_run_coro(self, coro: Coroutine):
         "Called in worker thread to run a coroutine in the event loop"
