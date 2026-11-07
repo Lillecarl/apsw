@@ -1,0 +1,47 @@
+# The fork's own: the test matrix of build-pypi.yml, on every pull
+# request, with nothing published.
+name: Tests
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+
+  binary:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+       os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-15-intel, macos-14]
+       pyver: [cp311, cp312, cp313, cp314, cp314t, cp315, cp315t]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Test ${{ matrix.os }} ${{ matrix.pyver }}
+        uses: pypa/cibuildwheel@v4.3
+        env:
+          CIBW_BUILD: ${{ matrix.pyver }}-*
+          CIBW_BEFORE_BUILD: python -c "import shutil ; shutil.copyfile('tools/setup-pypi.cfg','setup.apsw')"
+          CIBW_TEST_COMMAND: python -m apsw.tests -v
+          APSW_HEAVY_DURATION: 2
+
+  pyodide:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pyver: [cp313, cp314, cp315]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Test pyodide ${{ matrix.pyver }}
+        uses: pypa/cibuildwheel@v4.3
+        env:
+          CIBW_BUILD: ${{ matrix.pyver }}-*
+          CIBW_BEFORE_BUILD: python -c "import shutil ; shutil.copyfile('tools/setup-pypi.cfg','setup.apsw')"
+          CIBW_TEST_COMMAND: python -m apsw.tests -v
+          APSW_HEAVY_DURATION: 2
+          CIBW_PLATFORM: pyodide
