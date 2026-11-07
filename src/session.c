@@ -532,8 +532,13 @@ APSWSession_get_change_patch_set(APSWSession *self, int changeset)
   void *pChangeset = NULL;
 
   assert(sqlite3_mutex_held(self->connection->dbmutex));
-  int rc = changeset ? sqlite3session_changeset(self->session, &nChangeset, &pChangeset)
-                     : sqlite3session_patchset(self->session, &nChangeset, &pChangeset);
+  int rc;
+  /* reads the current rows, which can wait for a lock.  The only callback
+     is the table filter, which takes the GIL itself. */
+  Py_BEGIN_ALLOW_THREADS
+    rc = changeset ? sqlite3session_changeset(self->session, &nChangeset, &pChangeset)
+                   : sqlite3session_patchset(self->session, &nChangeset, &pChangeset);
+  Py_END_ALLOW_THREADS;
 
   PyObject *result = NULL;
   if (rc != SQLITE_OK)
@@ -772,9 +777,12 @@ APSWSession_table_filter(PyObject *self_, PyObject *const *fast_args, Py_ssize_t
     ARG_EPILOG(NULL, Session_table_filter_USAGE, );
   }
 
-  Py_CLEAR(self->table_filter);
-  self->table_filter = Py_NewRef(callback);
+  /* changeset and patchset release the GIL while SQLite can call the old
+     filter, so it must not be freed under them */
+  DBMUTEX_ENSURE_ANY_THREAD(self->connection);
   sqlite3session_table_filter(self->session, session_table_filter_cb, callback);
+  Py_XSETREF(self->table_filter, Py_NewRef(callback));
+  sqlite3_mutex_leave(self->connection->dbmutex);
 
   Py_RETURN_NONE;
 }
@@ -2172,16 +2180,27 @@ APSWChangesetBuilder_add(PyObject *self_, PyObject *const *fast_args, Py_ssize_t
 
   int res = SQLITE_ERROR;
 
+  /* adding reads the schema through the schema connection */
+  sqlite3_mutex *schema_mutex = NULL;
+  if (self->connection)
+  {
+    DBMUTEX_ENSURE_ANY_THREAD(self->connection);
+    schema_mutex = self->connection->dbmutex;
+  }
+
   if (PyCallable_Check(changeset))
     res = sqlite3changegroup_add_strm(self->group, APSWSession_xInput, changeset);
   else
   {
     Py_buffer changeset_buffer;
-    if (0 != PyObject_GetBufferContiguousBounded(changeset, &changeset_buffer, PyBUF_SIMPLE, INT32_MAX))
-      return NULL;
-    res = sqlite3changegroup_add(self->group, changeset_buffer.len, changeset_buffer.buf);
-    PyBuffer_Release(&changeset_buffer);
+    if (0 == PyObject_GetBufferContiguousBounded(changeset, &changeset_buffer, PyBUF_SIMPLE, INT32_MAX))
+    {
+      res = sqlite3changegroup_add(self->group, changeset_buffer.len, changeset_buffer.buf);
+      PyBuffer_Release(&changeset_buffer);
+    }
   }
+  if (schema_mutex)
+    sqlite3_mutex_leave(schema_mutex);
   SET_EXC(res, NULL);
   if (PyErr_Occurred())
     return NULL;
@@ -2216,7 +2235,16 @@ APSWChangesetBuilder_add_change(PyObject *self_, PyObject *const *fast_args, Py_
   if (!change->iter)
     return PyErr_Format(ExcInvalidContext, "The table change has gone out of scope");
 
+  /* adding reads the schema through the schema connection */
+  sqlite3_mutex *schema_mutex = NULL;
+  if (self->connection)
+  {
+    DBMUTEX_ENSURE_ANY_THREAD(self->connection);
+    schema_mutex = self->connection->dbmutex;
+  }
   int rc = sqlite3changegroup_add_change(self->group, change->iter);
+  if (schema_mutex)
+    sqlite3_mutex_leave(schema_mutex);
   SET_EXC(rc, NULL);
 
   if (PyErr_Occurred())
@@ -2401,9 +2429,19 @@ APSWChangesetBuilder_add_insert(PyObject *self_, PyObject *const *fast_args, Py_
 
   char *zErr = NULL;
 
+  /* begin and finish read the schema through the schema connection */
+  sqlite3_mutex *schema_mutex = NULL;
+  if (self->connection)
+  {
+    DBMUTEX_ENSURE_ANY_THREAD(self->connection);
+    schema_mutex = self->connection->dbmutex;
+  }
+
   int res = sqlite3changegroup_change_begin(self->group, SQLITE_INSERT, table, indirect, &zErr);
   if (res != SQLITE_OK)
   {
+    if (schema_mutex)
+      sqlite3_mutex_leave(schema_mutex);
     make_exception_with_message(res, zErr, -1);
     sqlite3_free(zErr);
     return NULL;
@@ -2412,6 +2450,8 @@ APSWChangesetBuilder_add_insert(PyObject *self_, PyObject *const *fast_args, Py_
   APSWChangesetBuilder_row(self, 1, row);
 
   res = sqlite3changegroup_change_finish(self->group, !!PyErr_Occurred(), &zErr);
+  if (schema_mutex)
+    sqlite3_mutex_leave(schema_mutex);
   if (res != SQLITE_OK)
   {
     make_exception_with_message(res, zErr, -1);
@@ -2457,9 +2497,19 @@ APSWChangesetBuilder_add_delete(PyObject *self_, PyObject *const *fast_args, Py_
 
   char *zErr = NULL;
 
+  /* begin and finish read the schema through the schema connection */
+  sqlite3_mutex *schema_mutex = NULL;
+  if (self->connection)
+  {
+    DBMUTEX_ENSURE_ANY_THREAD(self->connection);
+    schema_mutex = self->connection->dbmutex;
+  }
+
   int res = sqlite3changegroup_change_begin(self->group, SQLITE_DELETE, table, indirect, &zErr);
   if (res != SQLITE_OK)
   {
+    if (schema_mutex)
+      sqlite3_mutex_leave(schema_mutex);
     make_exception_with_message(res, zErr, -1);
     sqlite3_free(zErr);
     return NULL;
@@ -2468,6 +2518,8 @@ APSWChangesetBuilder_add_delete(PyObject *self_, PyObject *const *fast_args, Py_
   APSWChangesetBuilder_row(self, 0, row);
 
   res = sqlite3changegroup_change_finish(self->group, !!PyErr_Occurred(), &zErr);
+  if (schema_mutex)
+    sqlite3_mutex_leave(schema_mutex);
   if (res != SQLITE_OK)
   {
     make_exception_with_message(res, zErr, -1);
@@ -2517,9 +2569,19 @@ APSWChangesetBuilder_add_update(PyObject *self_, PyObject *const *fast_args, Py_
 
   char *zErr = NULL;
 
+  /* begin and finish read the schema through the schema connection */
+  sqlite3_mutex *schema_mutex = NULL;
+  if (self->connection)
+  {
+    DBMUTEX_ENSURE_ANY_THREAD(self->connection);
+    schema_mutex = self->connection->dbmutex;
+  }
+
   int res = sqlite3changegroup_change_begin(self->group, SQLITE_UPDATE, table, indirect, &zErr);
   if (res != SQLITE_OK)
   {
+    if (schema_mutex)
+      sqlite3_mutex_leave(schema_mutex);
     make_exception_with_message(res, zErr, -1);
     sqlite3_free(zErr);
     return NULL;
@@ -2530,6 +2592,8 @@ APSWChangesetBuilder_add_update(PyObject *self_, PyObject *const *fast_args, Py_
     APSWChangesetBuilder_row(self, 1, new);
 
   res = sqlite3changegroup_change_finish(self->group, !!PyErr_Occurred(), &zErr);
+  if (schema_mutex)
+    sqlite3_mutex_leave(schema_mutex);
   if (res != SQLITE_OK)
   {
     make_exception_with_message(res, zErr, -1);

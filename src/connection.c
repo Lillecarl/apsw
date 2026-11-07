@@ -554,9 +554,13 @@ Connection_close_internal(Connection *self, int force)
 
   sqlite3_mutex_leave(dbmutex);
 
+  /* the last close of a WAL database checkpoints, which syncs to disk.
+     self->db is already cleared, so no other thread can reach db. */
   for (int count = 0; count < 100; count++)
   {
-    res = sqlite3_close(db);
+    Py_BEGIN_ALLOW_THREADS
+      res = sqlite3_close(db);
+    Py_END_ALLOW_THREADS;
     if (res == SQLITE_BUSY)
     {
       /* we can be racing with a destructor such as cursor which is
@@ -572,7 +576,9 @@ Connection_close_internal(Connection *self, int force)
     /* we consider the connection closed but are unable to close it.  the likely
        explanation is problems with a dependent, or an extension.  the former
        won't happen unless we run out of memory */
-    sqlite3_close_v2(db);
+    Py_BEGIN_ALLOW_THREADS
+      sqlite3_close_v2(db);
+    Py_END_ALLOW_THREADS;
 
     SET_EXC(res, NULL);
     if (force == 2)
@@ -638,6 +644,12 @@ Connection_close(PyObject *self_, PyObject *const *fast_args, Py_ssize_t fast_na
     ARG_OPTIONAL ARG_bool(force);
     ARG_EPILOG(NULL, Connection_close_USAGE, );
   }
+
+  /* closed, or a close in another thread is partway through with the GIL
+     released.  It cleared self->db and self->dbmutex first, so the mutex
+     check below would pass and both would free the same objects. */
+  if (!self->db)
+    Py_RETURN_NONE;
 
   DBMUTEX_ENSURE_ANY_THREAD(self);
   if (0 != Connection_close_internal(self, force))
@@ -1048,7 +1060,10 @@ Connection_blob_open(PyObject *self_, PyObject *const *fast_args, Py_ssize_t fas
   ASYNC_FASTCALL(self, Connection_blob_open);
 
   DBMUTEX_ENSURE(self);
-  res = sqlite3_blob_open(self->db, database, table, column, rowid, writeable, &blob);
+  /* reads the schema and the row, which can wait for a lock */
+  Py_BEGIN_ALLOW_THREADS
+    res = sqlite3_blob_open(self->db, database, table, column, rowid, writeable, &blob);
+  Py_END_ALLOW_THREADS;
 
   SET_EXC(res, self->db);
   sqlite3_mutex_leave(self->dbmutex);
@@ -4868,7 +4883,11 @@ connection_context_manager_exec(Connection *self, const char *sql, int continue_
   }
 
   char *errmsg = NULL;
-  int res = sqlite3_exec(self->db, sql, 0, 0, &errmsg);
+  int res;
+  /* BEGIN and COMMIT can wait for a lock and sync to disk */
+  Py_BEGIN_ALLOW_THREADS
+    res = sqlite3_exec(self->db, sql, 0, 0, &errmsg);
+  Py_END_ALLOW_THREADS;
   if (res != SQLITE_OK)
   {
     /* in these cases we won't create an exception */
@@ -5671,7 +5690,10 @@ Connection_table_exists(PyObject *self_, PyObject *const *fast_args, Py_ssize_t 
   ASYNC_FASTCALL(self, Connection_table_exists);
 
   DBMUTEX_ENSURE(self);
-  res = sqlite3_table_column_metadata(self->db, dbname, table_name, NULL, NULL, NULL, NULL, NULL, NULL);
+  /* reading the schema can wait for a lock */
+  Py_BEGIN_ALLOW_THREADS
+    res = sqlite3_table_column_metadata(self->db, dbname, table_name, NULL, NULL, NULL, NULL, NULL, NULL);
+  Py_END_ALLOW_THREADS;
   if (res != SQLITE_OK && res != SQLITE_ERROR)
     SET_EXC(res, self->db);
   sqlite3_mutex_leave(self->dbmutex);
@@ -5728,8 +5750,11 @@ Connection_column_metadata(PyObject *self_, PyObject *const *fast_args, Py_ssize
   ASYNC_FASTCALL(self, Connection_column_metadata);
 
   DBMUTEX_ENSURE(self);
-  res = sqlite3_table_column_metadata(self->db, dbname, table_name, column_name, &datatype, &collseq, &notnull,
-                                      &primarykey, &autoinc);
+  /* reading the schema can wait for a lock */
+  Py_BEGIN_ALLOW_THREADS
+    res = sqlite3_table_column_metadata(self->db, dbname, table_name, column_name, &datatype, &collseq, &notnull,
+                                        &primarykey, &autoinc);
+  Py_END_ALLOW_THREADS;
 
   SET_EXC(res, self->db);
   sqlite3_mutex_leave(self->dbmutex);
@@ -5756,7 +5781,10 @@ Connection_cache_flush(PyObject *self_, PyObject *unused)
   ASYNC_BINARY(self, Connection_cache_flush, self_, unused);
 
   DBMUTEX_ENSURE(self);
-  res = sqlite3_db_cacheflush(self->db);
+  /* writing dirty pages can wait for readers */
+  Py_BEGIN_ALLOW_THREADS
+    res = sqlite3_db_cacheflush(self->db);
+  Py_END_ALLOW_THREADS;
   SET_EXC(res, self->db);
   sqlite3_mutex_leave(self->dbmutex);
 

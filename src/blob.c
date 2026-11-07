@@ -163,8 +163,14 @@ APSWBlob_close_internal(APSWBlob *self, int force)
 
   if (self->pBlob)
   {
+    /* the close of a written blob commits.  length() and seek() read
+       self->pBlob without the db mutex, so clear it first */
+    sqlite3_blob *blob = self->pBlob;
     int res;
-    res = sqlite3_blob_close(self->pBlob);
+    self->pBlob = 0;
+    Py_BEGIN_ALLOW_THREADS
+      res = sqlite3_blob_close(blob);
+    Py_END_ALLOW_THREADS;
     if (res != SQLITE_OK)
     {
       switch (force)
@@ -180,7 +186,6 @@ APSWBlob_close_internal(APSWBlob *self, int force)
         apsw_write_unraisable(NULL);
       }
     }
-    self->pBlob = 0;
     self->busy = 0;
   }
 
